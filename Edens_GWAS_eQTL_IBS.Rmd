@@ -1,0 +1,760 @@
+---
+title: "Co-localization of GWAS and eQTL candidates"
+author: "Edens"
+date: "12/14/2021"
+output: html_document
+---
+
+<center>
+
+## Irritable bowel syndrome 
+
+</center>
+
+
+## Overview
+
+In this code, I perform an association between Irritable bowel syndrome (IBS) genome-wide association study (GWAS) data and monocyte cell expression quantitative trait loci (eQTL) data for the purpose of selecting and prioritizing genes and single nucleotide polymorphisms (SNPs)
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(reshape2)
+library("plot3D")
+library(gridExtra)
+library(qqman)
+```
+
+```{r eval=FALSE}
+#Libraries
+library(tidyverse)
+library(reshape2)
+library("plot3D")
+library(gridExtra)
+library(qqman)
+```
+
+Include extra packages:
+
+```{r message=FALSE, warning=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("biomaRt")
+library(biomaRt)
+```
+
+
+#### Terms:
+
+* irritable bowel syndrome = IBS
+* genome-wide association study = GWAS
+* expression quantitative trait loci = eQTL
+* single nucleotide polymorphisms  = SNPs
+* megabasepair  = Mb
+* range +/- basepair range on either side = window
+* range +/- basepair range on both sides = full window
+
+
+## GWAS
+
+Data for IBS taken from GWAS Catalog
+
+* Genome Assembly GRCh38.p13
+* dbSNP Build 154
+* website: https://www.ebi.ac.uk/gwas/efotraits/EFO_0000555
+
+
+```{r}
+#Load GWAS Data
+
+path <- 'D:/BioInformatics/Fall2021/BMI559-Computational_Genetics/final/'
+fname <- 'gwas-association-downloaded_2021-11-28-EFO_0000555.tsv'
+
+gwas <- read.table(file.path(path,fname),sep = '\t', header = TRUE)
+```
+
+### EDA
+
+Show counts for each unique studies
+```{r}
+gwas %>%
+   dplyr::group_by(FIRST.AUTHOR,JOURNAL, PUBMEDID)%>%
+   dplyr::summarise(count = n())
+```
+
+* 53% of the data comes from one study
+* 78% of the data comes from one group
+
+P-value summary
+```{r}
+summary(gwas$P.VALUE)
+```
+
+* P-values are not very good for this data
+
+
+```{r}
+#Plot P-values to check distribution by study
+
+#For ease of plotting: will use MLog = -log(p-value)
+
+ggplot(data=gwas, aes(x=SNPS, y=PVALUE_MLOG, group=PUBMEDID)) +
+  geom_point(aes(shape=as.factor(PUBMEDID), color=as.factor(PUBMEDID))) +
+  ggtitle("-log(Pvalue) for GWAS SNPs") +
+  xlab("SNP Ids") +
+  ylab("Values") +
+  labs(color = "PubMed ID",shape= "PubMed ID") +
+  theme_classic() +
+  theme(
+    plot.title=element_text(family='', face='bold', size=18),
+    axis.text = element_text(face='bold',size = 12, angle=90))
+```
+
+* No unique clustering of P-value by study.
+* The highest p-value (lowest Mlog) is from a meta-analysis by Bonfiglio et al.
+* The lowest p-value (highest Mlog) is from the large study by Bonfiglio et al.
+
+
+With such a small number of data points and no obvious clustering, I will not drop any data. 
+
+Check for differences between reported SNP ID and Current SNP ID
+```{r}
+SNP_ID_check <- gwas$SNPS
+SNP_ID_Current <- gwas$SNP_ID_CURRENT
+
+SNP_ID_check <- as.numeric( sub("rs", "", SNP_ID_check, fixed = TRUE))
+setdiff(SNP_ID_check,SNP_ID_Current)
+rm(SNP_ID_check)
+rm(SNP_ID_Current)
+```
+
+* No differences. The SNP ID should be safe to use.
+
+
+```{r}
+#fix blank entries for mapped genes by using the reported gene 
+i=1
+j=15
+for (i in 1:dim(gwas)[1]) {
+  if (gwas[i,j] == "") {
+     gwas[i,j]<- gwas[i,j-1]
+  } 
+}
+```
+
+### Preparation for co-localization
+
+Get list of chromosomes for GWAS SNPs
+```{r}
+gwas_chrom <- unique(gwas$CHR_ID)
+```
+
+Separate intergenic and intragenic SNPs
+```{r}
+inter_GWAS <- gwas[gwas$INTERGENIC == 1,]
+dim(inter_GWAS) 
+
+intra_GWAS <- gwas[gwas$INTERGENIC == 0,]
+dim(intra_GWAS)
+```
+
+* 16 of the GWAS SNPS occur between inside genes
+* 12 of the GWAS SNPS occur between two genes. 
+
+check for multiple SNPs in same gene
+```{r}
+subset(intra_GWAS,duplicated(SNP_GENE_IDS))[22]
+```
+There is one case of two SNPs occurring in the gene LINC01505. For the purpose of the following analysis, only one intragenic SNP is needed. The lower p-value SNP will be eliminated. As there is only one instance, this will be done by hand. 
+
+```{r}
+intra_GWAS <- intra_GWAS[-c(13),]
+```
+
+Split multiple mapped genes into duplicate rows of one gene each
+```{r}
+intra_GWAS <- intra_GWAS %>%
+       mutate(MAPPED_GENE = strsplit(as.character(MAPPED_GENE), ", "),
+              SNP_GENE_IDS = strsplit(as.character(SNP_GENE_IDS), ", ")) %>%
+       unnest(c(MAPPED_GENE,SNP_GENE_IDS)) %>%
+       filter(MAPPED_GENE != "" | SNP_GENE_IDS != "" )
+```
+
+
+* There is only once occurrence of a single SNP inside two genes.
+
+
+#### biomaRt
+
+* Retrieve the start and end positions for all genes associated with the GWAS SNPs.
+* The default genome build is GRCh38
+
+* website: https://bioconductor.org/packages/release/bioc/vignettes/biomaRt/inst/doc/accessing_ensembl.html#step1-identifying-the-database-you-need
+
+```{r}
+#syntax taken from the above website
+ensembl = useEnsembl(biomart = "genes", dataset="hsapiens_gene_ensembl")
+filters = listFilters(ensembl)
+filters[1:5,]
+```
+
+```{r}
+attributes = listAttributes(ensembl)
+attributes[1:5,]
+```
+
+
+```{r}
+GWAS_geneList <- getBM(attributes=c('hgnc_symbol','ensembl_gene_id','chromosome_name',
+                                    'start_position', 'end_position'),
+                       filters = 'ensembl_gene_id', 
+                       values = intra_GWAS$SNP_GENE_IDS,
+                       mart = ensembl)
+```
+
+Sort intra_GWAS by ensemble gene id
+```{r}
+intra_GWAS <- intra_GWAS[order(intra_GWAS$SNP_GENE_IDS),]
+```
+
+Quality check: make sure all SNPs are within gene coordinates
+```{r}
+intra_GWAS[intra_GWAS$CHR_POS < GWAS_geneList$start_position | 
+  intra_GWAS$CHR_POS > GWAS_geneList$end_position,]
+```
+
+* QC check: All SNPs are located within their associated gene
+
+
+Get average and standard deviation for gene bp length.
+```{r}
+#The average will be used as a reference for the intergene sensitivity analysis
+
+bpl <- GWAS_geneList$end_position-GWAS_geneList$start_position
+avg_bpl <- mean(bpl)
+cat("Avergae basepair size of GWAS genes: ", avg_bpl, "\n")
+
+
+sd_bpl <- sd(bpl)
+cat("standard deviation of basepair size for GWAS genes: ", sd_bpl, "\n")
+```
+
+* So the average is ~ 0.3 +/- 0.5 Mb for the gene size. That is a large spread, but the average is only needed as a benchmark so it does not matter much.
+
+Finalize GWAS datasets
+```{r}
+gene_GWAS <- cbind(intra_GWAS$SNPS,GWAS_geneList)
+names(gene_GWAS)[1] <- "SNPS"
+gene_GWAS <- cbind(gene_GWAS,intra_GWAS[,27:29])
+
+nc_GWAS <- inter_GWAS$SNPS
+names(nc_GWAS)[1] <- "SNPS"
+nc_GWAS <- cbind(nc_GWAS,inter_GWAS[,c(12,13,27:29)])
+```
+
+
+
+## eQTL
+
+Data for monocyte cells taken from DICE Catalog
+
+* Reference Genome: GRCh37.p19
+* Build Date: 6.15.18
+* DICE Build: IDDICE-DB 1
+* website: https://dice-database.org/downloads
+
+* Converted to GRCh38 using Assembly Converter
+* website: https://uswest.ensembl.org/Homo_sapiens/Tools/AssemblyConverter?db=core
+
+
+```{r}
+#Function for loading and organizing the data
+
+read_eQTL_vcf <- function(path,fname){
+
+  #Load data
+  colheader = c("Chrom", "Pos","ID","Ref","Alt","Qual","Filter","INFO")
+  df<-read.table(file.path(path,fname), stringsAsFactors = FALSE, 
+                           header=F, col.names = colheader)
+  
+  #Clean up dataframe
+  df <- 
+    separate(df,INFO,c("Gene","GeneSymbol","Pvalue","Beta"),sep=";" )
+  
+  df$Gene <- 
+  substr(df$Gene, 6, nchar(df$Gene))
+  
+  df$GeneSymbol <- 
+  substr(df$GeneSymbol, 12, nchar(df$GeneSymbol))
+  
+  df$Pvalue <- 
+  as.numeric(substr(df$Pvalue, 8, nchar(df$Pvalue)))
+  
+  return(df)
+  }
+```
+
+
+Load monocyte data
+```{r}
+fname <-'eQTL/MONOCYTES.vcf'
+eQTL_monocytes <- read_eQTL_vcf(path=path,fname=fname)
+```
+
+### EDA
+
+```{r}
+dim(eQTL_monocytes)
+summary(eQTL_monocytes$Pvalue)
+```
+
+* Data was pre-filtered to eliminates data with P-values > 1.0e-04
+* The P-values for eQTLS do not seem to be a strict as GWAS data. To ensure I get enough eQTL associations with my limited GWAS data, I will not filter the eQTL further based on P-value. 
+
+
+
+```{r}
+#select only eQTLs on the same chromosome as the GWAS SNPs
+
+slct_monocytes <- {}
+
+for(i in 1:length(gwas_chrom)) {
+  slct_monocytes <- rbind(slct_monocytes,eQTL_monocytes[eQTL_monocytes$Chrom == gwas_chrom[i],])
+}
+
+```
+
+Look at eQTL Chromosome distribution via Manhattan plot
+```{r}
+slct_monocytes$Chrom <- as.numeric(slct_monocytes$Chrom)
+manhattan(slct_monocytes, chr="Chrom", bp="Pos", snp="ID", p="Pvalue")
+```
+
+
+
+## eQTL-GWAS Gene association
+
+Find how many eQTLs are inside each of the GWAS genes
+```{r}
+gene_eQTL_stats <- {}
+
+#for each gene in GWAS list 
+for(i in 1:nrow(gene_GWAS)) {
+  
+  #eQTLs on the same chromosome
+  tmp <- eQTL_monocytes[eQTL_monocytes$Chrom == gene_GWAS[i,4],]
+  
+  #eQTLs within the gene position window
+  eQTL_list <- tmp[tmp$Pos >= gene_GWAS[i,5] & 
+  tmp$Pos <= gene_GWAS[i,6],]
+  
+  #Counts and averages
+  if(dim(eQTL_list)[1] > 0){
+    gene_eQTL_stats <- rbind(gene_eQTL_stats,
+                             c(gene_GWAS[i,2], dim(eQTL_list)[1], mean(as.numeric(eQTL_list$Pvalue))))
+  }
+  
+  #clean up
+  rm(tmp)
+  rm(eQTL_list)
+}
+```
+
+
+Clean up eQTL stats report
+```{r}
+tmp <- -log10(as.numeric(gene_eQTL_stats[,3]))
+gene_eQTL_stats <- cbind(gene_eQTL_stats,data.frame(tmp))
+
+colnames(gene_eQTL_stats) <- c("hgnc_symbol","eQTL_Count","eQTL_pvalue", "eQTL_MLog")
+gene_eQTL_stats
+```
+
+
+```{r}
+#Prep for plotting
+gene_stats <- merge(gene_GWAS,gene_eQTL_stats, by="hgnc_symbol")
+```
+
+
+```{r}
+ggplot(data=gene_stats, aes(x=as.numeric(eQTL_Count), y=eQTL_MLog)) +
+  geom_point(aes(color=as.factor(hgnc_symbol),size=12)) +
+  ggtitle("eQTL Count vs. eQTL Avergae Pvalue for GWAS Genes") +
+  xlab("eQTL Hit Count") +
+  ylab("Average -log(Pvalue)") +
+  xlim(0,50) +
+  geom_text(aes(label=hgnc_symbol),hjust=-0.2, vjust=0) +
+  theme_classic() +
+  theme(
+    plot.title=element_text(family='', face='bold', size=18),
+    axis.text = element_text(face='bold',size = 16, angle=90),
+    legend.title = element_blank(), legend.position = "none")
+```
+
+* If the less conservative P-value is applied (cutoff at 5), only 4 genes pass the test
+
+Setup loop for multiple plots of eQTLS within the GWAS genes
+```{r warning=FALSE}
+gene_plot1 <- function(i){
+#for(i in 4:4){
+  df <- eQTL_monocytes[eQTL_monocytes$Chrom == gene_stats[i,4],]
+  g <- ggplot(data=df, aes(x=as.numeric(Pos),group = i)) +
+  
+  geom_line( aes(y=-log10(as.numeric(Pvalue)))) + 
+  geom_vline(xintercept = as.numeric(intra_GWAS[intra_GWAS$MAPPED_GENE == gene_stats[i,1],13])
+             , size = 1.1, color = "red")+
+  xlim(as.numeric(gene_stats[i,5]),as.numeric(gene_stats[i,6])) +
+  ylim(4,20) +
+  theme_classic() +
+  theme(
+    axis.title.y = element_text(size=12),
+    plot.title=element_text(family='', face='bold', size=16),
+    axis.text = element_text(face='bold',size = 9),
+    legend.title = element_blank(), legend.position = "none") +
+  xlab("Position") + ylab("-log(Pvalue)") + ggtitle(gene_stats[i,1])
+  
+  #print(g)
+}
+
+```
+
+```{r warning=FALSE, message=FALSE}
+#Multiple plots
+plist <- lapply(1:4, gene_plot1)
+do.call("grid.arrange", c(plist, ncol=2))
+```
+
+```{r warning=FALSE}
+#Multiple plots
+plist <- lapply(5:8, gene_plot1)
+do.call("grid.arrange", c(plist, ncol=2))
+```
+
+* The red line in the above plots is the identifying GWAS SNP
+* The plot ranges correspond to the gene sizes
+* There are not a lof of eQTL hits in any of the genes and no true eQTL peaks
+
+
+```{r}
+scatter3D(as.numeric(gene_stats$RISK.ALLELE.FREQUENCY), 
+          as.numeric(gene_stats$PVALUE_MLOG), 
+          as.numeric(gene_stats$eQTL_Count),
+          xlab = "Risk Allele Freq.", ylab = "-log(Pvalue)", zlab = "eQTL Count", 
+          main = "Gene rank factors",font=3,
+          theta = 25, phi = 15, bty = "g", type = "h",
+          col = ramp.col(c("blue", "green","orange" ,"red")),
+          colkey = FALSE, pch = 20, cex = 2)
+text3D(as.numeric(gene_stats$RISK.ALLELE.FREQUENCY), 
+          as.numeric(gene_stats$PVALUE_MLOG), 
+          as.numeric(gene_stats$eQTL_Count),
+       labels = gene_stats$hgnc_symbol,
+
+        add = TRUE, colkey = FALSE, adj = -0.2,cex = 0.8)
+```
+
+
+##### Genes identified as high-priority via four factors
+
+1. STK17A
+2. DAGLB
+4. EPSTI1.
+
+
+### Additional Analysis
+
+If the window for eQTL association is expanded beyond the gene basepair limit, then better eQTL peaks can be identified. 
+
+
+##### Window : gene size +/- average gene size
+
+```{r warning=FALSE}
+#Setup loop for multiple plots of eQTLS near the GWAS genes
+
+gene_plot2 <- function(i){
+#for(i in 4:4){
+  df <- eQTL_monocytes[eQTL_monocytes$Chrom == gene_stats[i,4],]
+  g <- ggplot(data=df, aes(x=as.numeric(Pos),group = i)) +
+  
+  geom_line( aes(y=-log10(as.numeric(Pvalue)))) + 
+  geom_vline(xintercept = as.numeric(intra_GWAS[intra_GWAS$MAPPED_GENE == gene_stats[i,1],13])
+             , size = 1.1, color = "red")+
+  geom_vline(xintercept = as.numeric(gene_stats[i,5]), size = 0.8, color = "blue")+ 
+  geom_vline(xintercept = as.numeric(gene_stats[i,6]), size = 0.8, color = "blue")+
+  xlim(as.numeric(gene_stats[i,5]-avg_bpl),as.numeric(gene_stats[i,6]+avg_bpl)) +
+  ylim(4,30) +
+  theme_classic() +
+  theme(
+    axis.title.y = element_text(size=12),
+    plot.title=element_text(family='', face='bold', size=16),
+    axis.text = element_text(face='bold',size = 9),
+    legend.title = element_blank(), legend.position = "none") +
+  xlab("Position") + ylab("-log(Pvalue)") + ggtitle(gene_stats[i,1])
+  
+  #print(g)
+}
+
+```
+
+```{r warning=FALSE}
+#Multiple plots
+plist <- lapply(1:4, gene_plot2)
+do.call("grid.arrange", c(plist, ncol=2))
+```
+```{r warning=FALSE}
+#Multiple plots
+plist <- lapply(5:8, gene_plot2)
+do.call("grid.arrange", c(plist, ncol=2))
+```
+
+* The red line in the above plots is the identifying GWAS SNP
+* The blue lines in the above plots are the GWAS gene boundaries
+* Expanding the window allows for peaks to be identified
+
+##### Window : gene size +/- half average gene size
+
+```{r warning=FALSE}
+#Setup loop for multiple plots of eQTLS near select GWAS genes
+
+gene_plot3 <- function(i){
+#for(i in 4:4){
+  df <- eQTL_monocytes[eQTL_monocytes$Chrom == gene_stats[i,4],]
+  g <- ggplot(data=df, aes(x=as.numeric(Pos),group = i)) +
+  
+  geom_line( aes(y=-log10(as.numeric(Pvalue)))) + 
+  geom_vline(xintercept = as.numeric(intra_GWAS[intra_GWAS$MAPPED_GENE == gene_stats[i,1],13])
+             , size = 1.1, color = "red")+
+  geom_vline(xintercept = as.numeric(gene_stats[i,5]), size = 0.8, color = "blue")+ 
+  geom_vline(xintercept = as.numeric(gene_stats[i,6]), size = 0.8, color = "blue")+
+  xlim(as.numeric(gene_stats[i,5]-avg_bpl/2),as.numeric(gene_stats[i,6]+avg_bpl/2)) +
+  ylim(4,30) +
+  theme_classic() +
+  theme(
+    axis.title.y = element_text(size=12),
+    plot.title=element_text(family='', face='bold', size=16),
+    axis.text = element_text(face='bold',size = 7),
+    legend.title = element_blank(), legend.position = "none") +
+  xlab("Position") + ylab("-log(Pvalue)") + ggtitle(gene_stats[i,1])
+  
+  #print(g)
+}
+
+```
+
+```{r warning=FALSE}
+#Multiple plots
+plist <- lapply(c(1,3,5,8), gene_plot3)
+do.call("grid.arrange", c(plist, ncol=2))
+```
+
+* Only these four gene have peak-like structures of eQTLs nearby
+
+##### Genes identified as high-priority only via nearby eQTL Peaks
+
+1. ABLIM2
+2. EPSTI1
+3. MTSS1
+4. STK17A
+
+
+
+## eQTL-GWAS Intergene association
+
+
+With a larger window more eQTLs will be associated with a gvien SNP location. The sensitivity analysis was run with increasing window size until all 12 intergenic SNPS had an eQTl association. 
+
+
+```{r}
+#sensitivity test
+
+nc_stats_summary <- {}
+
+#loop for different window sizes. 50 was determined empirically.
+for(j in 1:50) {
+
+  nc_eQTL_stats <- {}
+  
+  #set basepair window
+  bpwindow <- avg_bpl*0.1*j
+    
+  for(i in 1:nrow(nc_GWAS)) {
+    
+    #eQTLs on the same chromosome
+    tmp <- eQTL_monocytes[eQTL_monocytes$Chrom == nc_GWAS[i,2],]
+    
+    #eQTLs within the gene position window
+    eQTL_list <- tmp[tmp$Pos >= (nc_GWAS[i,3]-bpwindow) & 
+    tmp$Pos <= (nc_GWAS[i,3]+bpwindow),]
+    
+    #Counts and averages
+    if(dim(eQTL_list)[1] > 0){
+      nc_eQTL_stats <- rbind(nc_eQTL_stats,c(nc_GWAS[i,1], dim(eQTL_list)[1]))
+    }
+    
+    #clean up
+    rm(tmp)
+    rm(eQTL_list)
+  }
+  
+  nc_stats_summary <- rbind(nc_stats_summary, c(bpwindow/avg_bpl*100, dim(nc_eQTL_stats)[1],
+                                        mean(as.numeric(nc_eQTL_stats[,2]))/dim(nc_eQTL_stats)[1])) 
+  rm(nc_eQTL_stats)
+  }
+  
+```
+
+Clean up eQTL summary report
+```{r}
+colnames(nc_stats_summary) <- c("window_size","SNP_count","avg_eQTL_count")
+nc_stats_summary <- as.data.frame(nc_stats_summary)
+```
+
+Plot results
+```{r}
+ggplot(data=nc_stats_summary, aes(x=as.numeric(window_size*2))) +
+  
+  geom_line( aes(y=SNP_count), size=1.5, color="blue") + 
+  geom_line( aes(y=avg_eQTL_count*.04), size=1.5, color="red") +
+  
+   scale_y_continuous(
+    name = "SNPs co-localized to a eQTL",
+    sec.axis = sec_axis(~.*25, name="Averge eQTL num per SNP")) +
+  
+  scale_x_continuous(
+    name = "Basepair percentage relative to average GWAS gene size",
+    sec.axis = sec_axis(~.*.0036, name="Full window size in Mb")) +
+  
+  theme_classic() +
+  theme(
+    axis.title.y = element_text(color = "blue", size=16),
+    axis.title.y.right = element_text(color = "red", size=16),
+    plot.title=element_text(family='', face='bold', size=18),
+    axis.text = element_text(face='bold',size = 16, angle=90),
+    legend.title = element_blank(), legend.position = "none") +
+  xlab("Basepair percentage relative to average GWAS gene size") +
+  ggtitle("Sensitivity Summary")
+```
+
+* A full window size equal to twice the average gene size (as derived from the intragenic SNPs) appears to associate just over half the intergenic SNPs with an eQTL. This full window size will be used going forward.
+
+
+Focus on one window size
+```{r}
+nc_eQTL_stats <- {}
+
+#set basepair window
+bpwindow <- avg_bpl
+    
+for(i in 1:nrow(nc_GWAS)) {
+    
+  #eQTLs on the same chromosome
+  tmp <- eQTL_monocytes[eQTL_monocytes$Chrom == nc_GWAS[i,2],]
+    
+  #eQTLs within the gene position window
+  eQTL_list <- tmp[tmp$Pos >= (nc_GWAS[i,3]-bpwindow) & 
+  tmp$Pos <= (nc_GWAS[i,3]+bpwindow),]
+  
+  #Store data into a list of lists
+  tmp2 <- list("SNP" = nc_GWAS[i,1],"SNP_location" = nc_GWAS[i,3],"eQTLs" = eQTL_list)
+  
+  if(i == 1){
+    nc_eQTL <- tmp2
+  }
+  else{
+    nc_eQTL <- c(nc_eQTL,tmp2)
+  }
+    
+  #Counts and averages
+  if(dim(eQTL_list)[1] > 0){
+    nc_eQTL_stats <- rbind(nc_eQTL_stats,c(nc_GWAS[i,1], dim(eQTL_list)[1]))
+  }
+    
+  #clean up
+  rm(tmp)
+  rm(tmp2)
+  rm(eQTL_list)
+  }
+```
+
+Clean up eQTL stats report
+```{r}
+colnames(nc_eQTL_stats) <- c("SNP","eQTL_count")
+nc_eQTL_stats <- as.data.frame(nc_eQTL_stats)
+```
+
+
+```{r}
+#Clean up zeros in nc_eQTL
+removeZeros <- {}
+for(i in seq(3,length(nc_eQTL),3)) {
+  if (dim(nc_eQTL[[i]])[1] == 0) {
+    removeZeros <- c(removeZeros,i-2, i-1, i)
+  }
+}
+nc_eQTL <- nc_eQTL[-removeZeros]
+```
+
+```{r}
+nc_eQTL_stats
+```
+
+* This shows the GWAS SNP name and number of close eQTLs
+* Focus will be given to the SNPs with the 3 highest counts
+
+```{r}
+#Select top 3 SNPs in nc_eQTL
+
+removeZeros <- {}
+for(i in seq(3,length(nc_eQTL),3)) {
+  if (dim(nc_eQTL[[i]])[1] < 30) {
+    removeZeros <- c(removeZeros,i-2, i-1, i)
+  }
+}
+slct_nc_eQTL <- nc_eQTL[-removeZeros]
+
+```
+
+Setup loop for multiple plots
+```{r}
+SNP_plot <- function(i){
+#for(i in 1:2){
+  df <- slct_nc_eQTL[[i*3]]
+  g <- ggplot(data=df, aes(x=as.numeric(Pos),group = i)) +
+  
+  geom_path( aes(y=-log10(as.numeric(Pvalue)))) + 
+  geom_vline(xintercept = as.numeric(slct_nc_eQTL[[(i*3)-1]]), size = 1.1, color = "red")+
+  xlim(as.numeric(slct_nc_eQTL[[(i*3)-1]])-avg_bpl,as.numeric(slct_nc_eQTL[[(i*3)-1]])+avg_bpl ) +
+  ylim(4,30) +
+  theme_classic() +
+  theme(
+    axis.title.y = element_text(size=12),
+    plot.title=element_text(family='', face='bold', size=16),
+    axis.text = element_text(face='bold',size = 9),
+    legend.title = element_blank(), legend.position = "none") +
+  xlab("Position") + ylab("-log(Pvalue)") + ggtitle(slct_nc_eQTL[[(i*3)-2]])
+  
+  #print(g), angle=90
+}
+
+```
+
+```{r}
+#Multiple plots
+plist <- lapply(1:(length(slct_nc_eQTL)/3), SNP_plot)
+do.call("grid.arrange", c(plist, ncol=2))
+```
+
+ 
+* Only SNPs rs2523599 and rs4663866 are near any eQTL peaks. 
+
+##### GWAS intergenic SNPs identified as high-priority:
+ 
+1. rs2523599
+2. rs4663866
+ 
+ 
+ 
+ 
+ 
