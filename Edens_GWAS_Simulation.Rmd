@@ -1,0 +1,220 @@
+---
+title: "Simple GWAS Data Simulation"
+author: "Edens"
+date: "11/16/2021"
+output: html_document
+---
+
+
+
+<center>
+
+# GWAS Simulation
+
+</center>
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(reshape2)
+```
+
+
+
+## Summary of Code
+
+The following code blocks perform multiple simulated GWAS studies. The GWAS_Study function is defined using the code provided in the homework for a single "study" on one SNP. Two *for loops* within the function allow for multiple studies to be simulated serially, each with 5,000 SNPs. 
+
+**Input**: nreplications (The number of study replicates)
+
+**Output**: Depends on the number of study replicates. If nreplications is one, the output is the single lambda values for the main effect and environmental interaction are printed along with an array containing the pvalues from each SNP for that single study. If nreplications is greater than one, the output is a matrix of main effect and environmental interaction lambda values. 
+
+## Terms:
+
+* genomic control coefficient = lambda 
+
+* beta = coefficient estimates 
+
+* se = standard errors
+
+* me = main effect
+
+* env = environmental interaction effect
+
+
+## Code setup
+```{r}
+
+GWAS_study <- function(nreplications){
+  
+    #Initialize lambda array
+    me_lambda <- {}
+    env_lambda <- {}
+
+  for (i in 1:nreplications) {
+    
+    #Number of independent SNPs
+    nSNP <- 5000
+    
+    #Initialize results matrices
+    me <- matrix(0, nrow = nSNP, ncol = 3) 
+    env <- matrix(0, nrow = nSNP, ncol = 3) 
+    
+    #Loop for each SNP
+    for (j in 1:nSNP) {
+    
+      #single data set
+      environ <- rpois(1000, 10)
+      outcome <- environ*(environ+rnorm(1000))
+      
+      #SNP variable with minor allele frequency 0.3
+      gene <- rbinom(1000, 2, 0.3)
+      
+      #linear model for the main effect of SNP
+      maineffect <- lm(outcome~gene)
+      
+      #interaction between SNP and environment
+      interact <- lm(outcome~gene*environ)
+      
+      #find beta, se, and pvalues for the main effect
+      effect_array <- coef(summary(maineffect))
+      
+      #beta
+      me[j,1] <- effect_array[2,1]
+      #stdev
+      me[j,2] <- effect_array[2,2]
+      #pvalue
+      me[j,3] <- effect_array[2,4]
+      
+      #find beta, se, and pvalues for the environmental effect
+      env_array <- coef(summary(interact))
+
+      #e_beta
+      env[j,1] <- env_array[2,1]
+      #e_stdev
+      env[j,2] <- env_array[2,2]
+      #e_pvalue
+      env[j,3] <- env_array[2,4]
+    }
+    #lambda <- median( (beta/se)^2)/ 0.4549
+    
+    me_lambda[i] <- median( (me[,1]/me[,2])^2)/ 0.4549
+    env_lambda[i] <- median( (env[,1]/env[,2])^2)/ 0.4549
+    
+  }
+    
+  #output
+  if (nreplications == 1){
+      
+    cat("me lambda: ",me_lambda[1],"\n","env lambda: ",env_lambda[1],"\n")
+    return(cbind(me[,3],env[,3]))
+    
+  }
+  else{
+    #columns are
+    #  mm lambda | env lambda |
+    return(cbind(me_lambda,env_lambda))
+  }
+}
+```
+
+
+## Generate a single GWAS study with 5000 independent SNPs
+
+```{r}
+number_of_studies <- 1
+
+singleStudy <- GWAS_study(number_of_studies)
+```
+
+## A quantile-quantile plot and lambda for the main effect.
+
+### Lambda  = 1.041182 
+
+```{r}
+qqplot(-log10(ppoints(length(singleStudy[,1]))), -log10(singleStudy[,1]), xlab="sorted distribution of –log10p", ylab="expected distribution of –log10p")
+abline(0,1)
+```
+
+
+## A quantile-quantile plot and lambda for the environmental effect.
+
+
+### Lambda  = 3.381162  
+
+```{r}
+qqplot(-log10(ppoints(length(singleStudy[,2]))), -log10(singleStudy[,2]), xlab="sorted distribution of –log10p", ylab="expected distribution of –log10p")
+abline(0,1)
+```
+
+
+## Generate a resonable number of replica GWAS studies. 
+
+```{r}
+number_of_studies <- 200
+
+multipleStudies <- GWAS_study(number_of_studies)
+```
+
+
+
+##Lambdas for the main effects and environmental interactions
+
+### Average results
+
+```{r}
+cat("Average me lambda: ",median(multipleStudies[,1]),
+    "+/-",sd(multipleStudies[,1]),"\n")
+cat("Average env lambda: ",median(multipleStudies[,2]),
+    "+/-",sd(multipleStudies[,2]),"\n")
+```
+
+```{r}
+df <- melt(multipleStudies)
+ggplot(data=df,aes(x = factor(Var2), y=value, fill = factor(Var2))) +
+  geom_boxplot() +
+  ggtitle("Lambda Averages") +
+  xlab("Lambda Source") +
+  ylab("Lambda Value") +
+  theme_classic() +
+  theme(
+    plot.title=element_text(family='', face='bold', size=18),
+    axis.text = element_text(face='bold',size = 12),
+    legend.title = element_blank())
+```
+
+
+### Plot of Lambdas from study replications
+```{r}
+ggplot(data=df) +
+  geom_point(aes(x = Var1, y=value, color = factor(Var2), 
+                  shape = factor(Var2)),size=2, stroke=2) +
+  scale_color_discrete(name = "Class", labels = c("me", "env")) +
+  scale_shape_manual(name = "Class", labels = c("me", "env"), values = c(1,2)) +
+  ggtitle("Main effects and environmental interaction Lambdas") +
+  xlab("Study replication Number") +
+  ylab("Lambda Value") +
+  theme_classic() +
+  theme(
+    plot.title=element_text(family='', face='bold', size=18),
+    axis.text = element_text(face='bold',size = 12))
+
+```
+
+
+
+## Summary of Results
+
+Lambda measures the departure of the median p-value from its expected position. We observe lambda values close to unity for all main effects, indicating the SNPs frequency follow our null expectation and do not have any association with the outcome. As this data is simulated via a standard Poisson distribution, this is the effect we would expect.
+
+The lambda values for environmental interactions are not close to unity, instead averaging near 3.2. This would indicate a confounding environmental effect. This deviation is observed both in a single study and in the multiple study replicas. If this was a real dataset, it would indicate an issue with the data that would need to be addressed. Likely this would involve trying to remove the confounding elements from the SNP frequency data. 
+
+
+If the relationship between the main outcome and the environmental variable was exactly linear, there would be no deviation from the expected line in the QQ plot. Without an observable effect from the QQ plot or lambda value, other techniques would be required to find any confounding effects.
+
+
+
+
+
