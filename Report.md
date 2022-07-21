@@ -32,9 +32,13 @@ Only SNPs rs2523599 and rs4663866 are near any significant numbers of eQTLs. Int
 ## Caveats
 
 •	53% of my data came from a Europe and United States women-only study. This will bias my final rankings toward that population group.
+
 •	Accepting low P-value GWAS data greatly increased my false discovery odds.
+
 •	My eQTL data is point-based SNPs, without estimated ranges, meaning I am relying only on the SNP markers when determining associations based on location.
+
 •	I focused only on one cell type (monocyte cells) due to time constraints (more cell types were originally planned)
+
 •	Using a coordinate-based approach means I only looked for cis-eQTLs.
 
 ## Discussion
